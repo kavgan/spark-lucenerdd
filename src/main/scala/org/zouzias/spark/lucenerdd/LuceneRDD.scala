@@ -157,15 +157,17 @@ class LuceneRDD[T: ClassTag](protected val partitionsRDD: RDD[AbstractLuceneRDDP
     val queriesB = partitionsRDD.context.broadcast(queries)
     logDebug("Query points broadcasting was successfully")
 
-    val resultsByPart: RDD[(Long, TopK[SparkScoreDoc])] = partitionsRDD.flatMap {
-      case partition => queriesB.value.zipWithIndex.par.map { case (qr, index) =>
-        val results = partition.query(qr, topK)
-          .map(x => monoid.build(x))
+    val resultsByPart: RDD[(Long, TopK[SparkScoreDoc])] = partitionsRDD.mapPartitions(partitions =>
+        partitions.flatMap { case partition =>
+          queriesB.value.zipWithIndex.par.map { case (qr, index) =>
+            val results = partition.query(qr, topK)
+              .map(x => monoid.build(x))
 
-        (index.toLong, results.reduceOption(monoid.plus)
-          .getOrElse(monoid.zero))
-      }.toList
-    }
+            (index.toLong, results.reduceOption(monoid.plus)
+              .getOrElse(monoid.zero))
+          }
+        }
+        , preservesPartitioning = true)
 
     logDebug("Compute topK linkage per partition")
     val results = resultsByPart.reduceByKey(monoid.plus)
