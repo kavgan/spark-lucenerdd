@@ -99,15 +99,18 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
     logDebug("Query points broadcasting was successfully")
 
     logDebug("Compute topK linkage per partition")
-    val resultsByPart: RDD[(Long, TopK[SparkScoreDoc])] = partitionsRDD.flatMap {
-      case partition => queriesB.value.zipWithIndex.par.map { case (queryPoint, index) =>
-        val results = mapper(queryPoint, partition).map(x => topKMonoid.build(x))
-          .reduceOption(topKMonoid.plus)
-          .getOrElse(topKMonoid.zero)
+    val resultsByPart: RDD[(Long, TopK[SparkScoreDoc])] = partitionsRDD.mapPartitions(partitions =>
+      partitions.flatMap { case partition =>
+        queriesB.value.zipWithIndex.par.map { case (queryPoint, index) =>
+          val results = mapper(queryPoint, partition).map(x => topKMonoid.build(x))
+            .reduceOption(topKMonoid.plus)
+            .getOrElse(topKMonoid.zero)
 
-        (index.toLong, results)
-      }.toList
-    }
+          (index.toLong, results)
+        }.toList
+      }
+      , preservesPartitioning = true
+    )
 
     logDebug("Merge topK linkage results")
     val results = resultsByPart.reduceByKey(topKMonoid.plus)
