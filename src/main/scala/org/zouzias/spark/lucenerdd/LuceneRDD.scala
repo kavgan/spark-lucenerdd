@@ -149,7 +149,7 @@ class LuceneRDD[T: ClassTag](protected val partitionsRDD: RDD[AbstractLuceneRDDP
   def link[T1: ClassTag](other: RDD[T1], searchQueryGen: T1 => String, topK: Int = DefaultTopK)
     : RDD[(T1, Array[SparkScoreDoc])] = {
     logInfo("Linkage requested")
-    val monoid = new TopKMonoid[SparkScoreDoc](topK)(SparkScoreDoc.descending)
+    val topKMonoid = new TopKMonoid[SparkScoreDoc](topK)(SparkScoreDoc.descending)
     logInfo("Collecting query points to driver")
     val queriesString = other.map(searchQueryGen).collect().mkString("$").getBytes("UTF-8")
     logInfo(s"Uncompressed queries: ${queriesString.length / 1024.0} MB")
@@ -165,16 +165,16 @@ class LuceneRDD[T: ClassTag](protected val partitionsRDD: RDD[AbstractLuceneRDDP
           Gzip.decompress(queriesB.value).getOrElse("")
             .split('$').zipWithIndex.par.map { case (qr, index) =>
             val results = partition.query(qr, topK)
-              .map(x => monoid.build(x))
+              .map(x => topKMonoid.build(x))
 
-            (index.toLong, results.reduceOption(monoid.plus)
-              .getOrElse(monoid.zero))
+            (index.toLong, results.reduceOption(topKMonoid.plus)
+              .getOrElse(topKMonoid.zero))
           }
         }
-        , preservesPartitioning = false)
+    )
 
     logInfo("Compute topK linkage per partition")
-    val results = resultsByPart.reduceByKey(monoid.plus(_, _),
+    val results = resultsByPart.reduceByKey(topKMonoid.plus _,
       this.getNumPartitions * other.getNumPartitions)
 
     other.zipWithIndex.map(_.swap).join(results).values
