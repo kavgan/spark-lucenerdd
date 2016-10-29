@@ -113,7 +113,8 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
     )
 
     logDebug("Merge topK linkage results")
-    val results = resultsByPart.reduceByKey(topKMonoid.plus)
+    val results = resultsByPart.reduceByKey(topKMonoid.plus(_, _),
+      this.getNumPartitions * that.getNumPartitions)
 
     that.zipWithIndex.map(_.swap).join(results).values
       .map(joined => (joined._1, joined._2.items.toArray))
