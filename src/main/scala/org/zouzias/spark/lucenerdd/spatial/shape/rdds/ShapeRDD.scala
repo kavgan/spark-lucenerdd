@@ -14,35 +14,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.zouzias.spark.lucenerdd.spatial.shape
+package org.zouzias.spark.lucenerdd.spatial.shape.rdds
 
 import com.spatial4j.core.shape.Shape
 import com.twitter.algebird.{TopK, TopKMonoid}
-import org.apache.lucene.document.Document
 import org.apache.lucene.spatial.query.SpatialOperation
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.{Row, _}
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark._
-import org.apache.spark.sql.{DataFrame, Dataset, Row}
+import org.apache.spark.{OneToOneDependency, Partition, TaskContext}
 import org.zouzias.spark.lucenerdd.config.LuceneRDDConfigurable
 import org.zouzias.spark.lucenerdd.models.SparkScoreDoc
 import org.zouzias.spark.lucenerdd.query.LuceneQueryHelpers
-import org.zouzias.spark.lucenerdd.response.{LuceneRDDResponse, LuceneRDDResponsePartition}
-import org.zouzias.spark.lucenerdd.spatial.shape.ShapeLuceneRDD.PointType
-import org.zouzias.spark.lucenerdd.spatial.shape.partition.{AbstractShapeLuceneRDDPartition, ShapeLuceneRDDPartition}
+import org.zouzias.spark.lucenerdd.spatial.shape.partition.AbstractShapeRDDPartition
+import org.zouzias.spark.lucenerdd.spatial.shape.partition.impl.ShapeRDDPartition
+import org.zouzias.spark.lucenerdd.spatial.shape.rdds.ShapeRDD.PointType
+import org.zouzias.spark.lucenerdd.spatial.shape.response.{ShapeRDDResponse, ShapeRDDResponsePartition}
 
 import scala.reflect.ClassTag
 
 /**
- * ShapeLuceneRDD for geospatial and full-text search queries
+ * ShapeRDD for spatial / geospatial queries. Index only the (single) spatial field
  *
- * @param partitionsRDD
+ * @param partitionsRDD Partitions containing the spatial lucene indices
  * @tparam K Type containing the geospatial information (must be implicitly converted to [[Shape]])
- * @tparam V Type containing remaining information (must be implicitly converted to [[Document]])
+ * @tparam V Type containing remaining information
  */
-class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
-  (private val partitionsRDD: RDD[AbstractShapeLuceneRDDPartition[K, V]])
-  extends RDD[(K, V)](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD)))
+class ShapeRDD[K: ClassTag, V: ClassTag]
+(private val partitionsRDD: RDD[AbstractShapeRDDPartition[K, V]])
+  extends RDD[((K, V), Long)](partitionsRDD.context, List(new OneToOneDependency(partitionsRDD)))
     with LuceneRDDConfigurable {
 
   logInfo("Instance is created...")
@@ -78,16 +78,16 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
     this
   }
 
-  setName("ShapeLuceneRDD")
+  setName("ShapeRDD")
 
-  private def partitionMapper(f: AbstractShapeLuceneRDDPartition[K, V] =>
-    LuceneRDDResponsePartition): LuceneRDDResponse = {
-    new LuceneRDDResponse(partitionsRDD.map(f), SparkScoreDoc.ascending)
+  private def partitionMapper(f: AbstractShapeRDDPartition[K, V] =>
+    ShapeRDDResponsePartition): ShapeRDDResponse = {
+    new ShapeRDDResponse(partitionsRDD.map(f), SparkScoreDoc.ascending)
   }
 
   private def linker[T: ClassTag](that: RDD[T], pointFunctor: T => PointType,
-    mapper: ( PointType, AbstractShapeLuceneRDDPartition[K, V]) =>
-                            Iterable[SparkScoreDoc]): RDD[(T, Array[SparkScoreDoc])] = {
+                                  mapper: ( PointType, AbstractShapeRDDPartition[K, V]) =>
+                                    Iterable[SparkScoreDoc]): RDD[(T, Array[SparkScoreDoc])] = {
     logDebug("Linker requested")
 
     val topKMonoid = new TopKMonoid[SparkScoreDoc](MaxDefaultTopKValue)(SparkScoreDoc.ascending)
@@ -132,7 +132,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    * broadcast to the workers.
    */
   def linkByKnn[T: ClassTag](that: RDD[T], pointFunctor: T => PointType,
-                           topK: Int = DefaultTopK)
+                             topK: Int = DefaultTopK)
   : RDD[(T, Array[SparkScoreDoc])] = {
     logInfo("linkByKnn requested")
     linker[T](that, pointFunctor, (queryPoint, part) =>
@@ -158,6 +158,24 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
     logInfo("linkByRadius requested")
     linker[T](that, pointFunctor, (queryPoint, part) =>
       part.circleSearch(queryPoint, radius, topK, spatialOp))
+  }
+
+
+  /**
+   * Post linker function. Picks the first result for linkage
+   *
+   * @param linkage
+   * @tparam T
+   * @return
+   */
+  def postLinker[T: ClassTag](linkage: RDD[(T, Array[SparkScoreDoc])]): RDD[(T, V)] = {
+    val linkageById: RDD[(Long, T)] = linkage.flatMap{ case (k, v) =>
+      v.headOption
+        .flatMap(x => x.doc.numericField(ShapeRDD.RddPositionFieldName).map(_.longValue()))
+        .map(x => (x, k))
+    }
+
+    linkageById.join(this.map(_.swap)).values.mapValues(_._2)
   }
 
 
@@ -209,7 +227,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    */
   def knnSearch(queryPoint: PointType, k: Int,
                 searchString: String = LuceneQueryHelpers.MatchAllDocsString)
-  : LuceneRDDResponse = {
+  : ShapeRDDResponse = {
     logInfo(s"Knn search with query ${queryPoint} and search string ${searchString}")
     partitionMapper(_.knnSearch(queryPoint, k, searchString))
   }
@@ -223,7 +241,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    * @return
    */
   def circleSearch(center: PointType, radius: Double, k: Int)
-  : LuceneRDDResponse = {
+  : ShapeRDDResponse = {
     logInfo(s"Circle search with center ${center} and radius ${radius}")
     // Points can only intersect
     partitionMapper(_.circleSearch(center, radius, k,
@@ -240,7 +258,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    */
   def spatialSearch(shapeWKT: String, k: Int,
                     operationName: String = SpatialOperation.Intersects.getName)
-  : LuceneRDDResponse = {
+  : ShapeRDDResponse = {
     logInfo(s"Spatial search with shape ${shapeWKT} and operation ${operationName}")
     partitionMapper(_.spatialSearch(shapeWKT, k, operationName))
   }
@@ -255,7 +273,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    */
   def spatialSearch(point: PointType, k: Int,
                     operationName: String)
-  : LuceneRDDResponse = {
+  : ShapeRDDResponse = {
     logInfo(s"Spatial search with point ${point} and operation ${operationName}")
     partitionMapper(_.spatialSearch(point, k, operationName))
   }
@@ -270,8 +288,8 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    * @return
    */
   def bboxSearch(center: PointType, radius: Double, k: Int,
-                    operationName: String = SpatialOperation.Intersects.getName)
-  : LuceneRDDResponse = {
+                 operationName: String = SpatialOperation.Intersects.getName)
+  : ShapeRDDResponse = {
     logInfo(s"Bounding box with center ${center}, radius ${radius}, k = ${k}")
     partitionMapper(_.bboxSearch(center, radius, k, operationName))
   }
@@ -286,7 +304,7 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
    */
   def bboxSearch(lowerLeft: PointType, upperRight: PointType, k: Int,
                  operationName: String)
-  : LuceneRDDResponse = {
+  : ShapeRDDResponse = {
     logInfo(s"Bounding box with lower left ${lowerLeft}, upper right ${upperRight} and k = ${k}")
     partitionMapper(_.bboxSearch(lowerLeft, upperRight, k, operationName))
   }
@@ -297,15 +315,15 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
   }
 
   /** RDD compute method. */
-  override def compute(part: Partition, context: TaskContext): Iterator[(K, V)] = {
-    firstParent[AbstractShapeLuceneRDDPartition[K, V]].iterator(part, context).next.iterator
+  override def compute(part: Partition, context: TaskContext): Iterator[((K, V), Long)] = {
+    firstParent[AbstractShapeRDDPartition[K, V]].iterator(part, context).next.iterator
   }
 
-  def filter(pred: (K, V) => Boolean): ShapeLuceneRDD[K, V] = {
+  def filter(pred: (K, V) => Boolean): ShapeRDD[K, V] = {
     val newPartitionRDD = partitionsRDD.mapPartitions(partition =>
       partition.map(_.filter(pred)), preservesPartitioning = true
     )
-    new ShapeLuceneRDD(newPartitionRDD)
+    new ShapeRDD(newPartitionRDD)
   }
 
   def exists(elem: K): Boolean = {
@@ -318,35 +336,37 @@ class ShapeLuceneRDD[K: ClassTag, V: ClassTag]
   }
 }
 
-object ShapeLuceneRDD {
+object ShapeRDD {
 
   /** Type for a point */
   type PointType = (Double, Double)
 
+  val RddPositionFieldName = "__index__"
+
   /**
-   * Instantiate a ShapeLuceneRDD given an RDD[T]
+   * Instantiate a ShapeRDD given an RDD[T]
    *
    * @param elems RDD of type T
    * @return
    */
   def apply[K: ClassTag, V: ClassTag](elems: RDD[(K, V)])
-                                     (implicit shapeConv: K => Shape,
-                                      docConverter: V => Document)
-  : ShapeLuceneRDD[K, V] = {
-    val partitions = elems.mapPartitions[AbstractShapeLuceneRDDPartition[K, V]](
-      iter => Iterator(ShapeLuceneRDDPartition[K, V](iter)),
+                                     (implicit shapeConv: K => Shape)
+  : ShapeRDD[K, V] = {
+    val elemsWithIndex = elems.zipWithIndex()
+    val partitions = elemsWithIndex.mapPartitions[AbstractShapeRDDPartition[K, V]](
+      iter => Iterator(ShapeRDDPartition[K, V](iter)),
       preservesPartitioning = true)
-    new ShapeLuceneRDD(partitions)
+    new ShapeRDD(partitions)
   }
 
   def apply[K: ClassTag, V: ClassTag](elems: Dataset[(K, V)])
-                                     (implicit shapeConv: K => Shape,
-                                      docConverter: V => Document)
-  : ShapeLuceneRDD[K, V] = {
-    val partitions = elems.rdd.mapPartitions[AbstractShapeLuceneRDDPartition[K, V]](
-      iter => Iterator(ShapeLuceneRDDPartition[K, V](iter)),
+                                     (implicit shapeConv: K => Shape)
+  : ShapeRDD[K, V] = {
+    val elemsWithIndex = elems.rdd.zipWithIndex()
+    val partitions = elemsWithIndex.mapPartitions[AbstractShapeRDDPartition[K, V]](
+      iter => Iterator(ShapeRDDPartition[K, V](iter)),
       preservesPartitioning = true)
-    new ShapeLuceneRDD(partitions)
+    new ShapeRDD(partitions)
   }
 
   /**
@@ -357,18 +377,4 @@ object ShapeLuceneRDD {
     // BuildInfo is automatically generated using sbt plugin `sbt-buildinfo`
     org.zouzias.spark.lucenerdd.BuildInfo.toMap
   }
-
-  /**
-   * Instantiate a ShapeLuceneRDD with an iterable
-   *
-   * @param elems Elements
-   * @param sc Spark Context
-   * @return
-
-  def apply[K: ClassTag, V: ClassTag]
-  (elems: Iterable[(K, V)])(implicit sc: SparkContext, shapeConv: K => Shape,
-                            docConverter: V => Document): ShapeLuceneRDD[K, V] = {
-    apply(sc.parallelize[(K, V)](elems.toSeq))
-  }
-  */
 }
